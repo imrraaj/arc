@@ -4,7 +4,7 @@ import { theme, colors } from "../theme";
 
 interface ApprovalPromptProps {
   toolName: string;
-  args: Record<string, any>;
+  args: Record<string, unknown>;
   onRespond: (approved: boolean) => void;
 }
 
@@ -26,54 +26,45 @@ export function ApprovalPrompt({ toolName, args, onRespond }: ApprovalPromptProp
   });
 
   const argsDisplay = JSON.stringify(args, null, 2);
-  const truncatedArgs = argsDisplay.length > 200 ? argsDisplay.slice(0, 200) + "..." : argsDisplay;
+  const truncatedArgs = argsDisplay.length > 900 ? argsDisplay.slice(0, 900) + "\n... (truncated)" : argsDisplay;
 
   return (
     <box
-      width={80}
-      padding={1}
+      width="100%"
+      paddingY={1}
       backgroundColor={colors.bg}
-      borderStyle="single"
-      borderColor={theme.yellow}
       flexDirection="column"
     >
-      <box width="100%" paddingX={1}>
+      <box width="100%" flexDirection="row" gap={1}>
         <text fg={theme.yellow}>
-          <strong>⚠ Tool approval needed</strong>
+          <strong>Permission</strong>
         </text>
+        <text fg={theme.fg}>{toolName}</text>
       </box>
 
-      <box width="100%" paddingX={1} marginTop={1}>
-        <text><strong>{toolName}</strong></text>
-      </box>
-
-      <box width="100%" paddingX={1} marginTop={1}>
+      <box width="100%" marginTop={1}>
         <text fg={theme.comment}>{truncatedArgs}</text>
       </box>
 
-      <box width="100%" flexDirection="column" marginTop={1} paddingX={1}>
+      <box width="100%" flexDirection="row" marginTop={1} gap={2}>
         <box
-          width="100%"
           backgroundColor={selectedOption === 0 ? theme.selection : undefined}
+          paddingX={1}
         >
           <text fg={selectedOption === 0 ? theme.green : theme.comment}>
             <strong>{selectedOption === 0 ? "▸ " : "  "}</strong>
-            YES - Approve this tool call
+            approve
           </text>
         </box>
         <box
-          width="100%"
           backgroundColor={selectedOption === 1 ? theme.selection : undefined}
+          paddingX={1}
         >
           <text fg={selectedOption === 1 ? theme.red : theme.comment}>
             <strong>{selectedOption === 1 ? "▸ " : "  "}</strong>
-            NO - Deny this tool call
+            deny
           </text>
         </box>
-      </box>
-
-      <box width="100%" marginTop={1} paddingX={1}>
-        <text fg={theme.comment}>[↑↓] select [enter] confirm [esc] deny</text>
       </box>
     </box>
   );

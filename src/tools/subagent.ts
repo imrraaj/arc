@@ -1,7 +1,7 @@
 import { tool, ToolLoopAgent } from 'ai';
 import { z } from 'zod';
 import { createDirTool, readDirTool } from './dir';
-import { createFileTool, readFileTool, writeFileTool } from './file';
+import { applyPatchTool, createFileTool, readFileTool } from './file';
 import { nvidia } from '@/provider';
 import { config } from '@/utils/config';
 
@@ -23,7 +23,7 @@ export const subAgentTool = tool({
             model: nvidia(selectedModel, nvidiaApiKey),
             tools: {
                 readFile: readFileTool,
-                writeFile: writeFileTool,
+                applyPatch: applyPatchTool,
                 createFile: createFileTool,
                 createDir: createDirTool,
                 readDir: readDirTool,

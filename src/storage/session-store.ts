@@ -1,9 +1,12 @@
 import { Database } from "bun:sqlite";
-import { mkdir, readFile, readdir } from "fs/promises";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { desc, eq, sql } from "drizzle-orm";
+import { readFile, readdir } from "fs/promises";
 import { join } from "path";
 import { fileURLToPath } from "url";
 import type { Message, ToolCall } from "@/types";
-import { config } from "@/utils/config";
+import * as schema from "@/storage/schema";
+import { config, ensureDataDir } from "@/utils/config";
 
 type TokenTotals = {
   input: number;
@@ -11,378 +14,259 @@ type TokenTotals = {
   total: number;
 };
 
-const EMPTY_TOKENS: TokenTotals = {
-  input: 0,
-  output: 0,
-  total: 0,
-};
-
-export interface PersistedSession {
-  id: string;
-  title: string;
-  messages: Message[];
-  toolCalls: ToolCall[];
-  timestamp: string;
-  model?: string;
-  conversationSummary?: string;
-  cumulativeTokens?: TokenTotals;
-}
-
-export interface SessionMeta {
-  id: string;
-  title: string;
-  timestamp: string;
-  model?: string;
-  messageCount: number;
-}
-
-type SessionRow = {
-  id: string;
-  title: string;
-  model: string | null;
-  conversation_summary: string | null;
-  updated_at: string;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  total_tokens: number | null;
-};
-
-type SessionMetaRow = {
-  id: string;
-  title: string;
-  timestamp: string;
-  model: string | null;
-  message_count: number;
-};
-
-type MessageRow = {
-  role: Message["role"];
-  content: string;
-};
-
-type ToolCallRow = {
-  id: string;
-  assistant_message_index: number;
-  name: string;
-  args_json: string;
-  result_json: string | null;
-  status: ToolCall["status"];
-  timestamp: string;
-};
+type Db = ReturnType<typeof drizzle<typeof schema>>;
+type ToolCallRow = typeof schema.toolCalls.$inferSelect;
 
 const MIGRATIONS_DIR = fileURLToPath(new URL("./migrations", import.meta.url));
+const EMPTY_TOKENS = { input: 0, output: 0, total: 0 } satisfies TokenTotals;
 
-let db: Database | null = null;
+let sqlite: Database | null = null;
+let db: Db | null = null;
 
-function generateSessionId(): string {
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${Date.now()}-${rand}`;
-}
+const toJson = (value: unknown) => {
+  if (value === undefined) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ error: "Value was not JSON serializable" });
+  }
+};
 
-function normalizeTokens(tokens: TokenTotals | undefined | null): TokenTotals {
-  return {
-    input: tokens?.input ?? 0,
-    output: tokens?.output ?? 0,
-    total: tokens?.total ?? 0,
-  };
-}
-
-function deriveTitle(messages: Message[], fallbackId: string): string {
-  const firstUser = messages.find((msg) => msg.role === "user")?.content?.trim();
-  if (firstUser) return firstUser.replace(/\s+/g, " ").slice(0, 48);
-  return `Session ${fallbackId.slice(0, 8)}`;
-}
-
-function parseJson<T>(value: string | null | undefined, fallback: T): T {
+const fromJson = <T,>(value: string | null, fallback: T): T => {
   if (!value) return fallback;
   try {
     return JSON.parse(value) as T;
   } catch {
     return fallback;
   }
-}
-
-function reviveToolCall(row: ToolCallRow): ToolCall {
-  const result = row.result_json === null
-    ? {}
-    : { result: parseJson(row.result_json, undefined) };
-
-  return {
-    id: row.id,
-    assistantMessageIndex: row.assistant_message_index,
-    name: row.name,
-    args: parseJson(row.args_json, {}),
-    status: row.status,
-    timestamp: new Date(row.timestamp),
-    ...result,
-  };
-}
-
-function toPersistedSession(
-  row: SessionRow,
-  messages: Message[],
-  toolCalls: ToolCall[],
-): PersistedSession {
-  return {
-    id: row.id,
-    title: row.title,
-    messages,
-    toolCalls,
-    timestamp: row.updated_at,
-    ...(row.model ? { model: row.model } : {}),
-    conversationSummary: row.conversation_summary ?? "",
-    cumulativeTokens: {
-      input: row.input_tokens ?? 0,
-      output: row.output_tokens ?? 0,
-      total: row.total_tokens ?? 0,
-    },
-  };
-}
-
-type Migration = {
-  filename: string;
-  version: number;
 };
 
-async function listMigrations(): Promise<Migration[]> {
-  const files = await readdir(MIGRATIONS_DIR);
-  return files
-    .map((filename): Migration | null => {
-      const match = filename.match(/^(\d+)_.*\.sql$/);
-      if (!match?.[1]) return null;
-      return {
-        filename,
-        version: Number(match[1]),
-      };
+const toDate = (value: string | null) => value ? new Date(value) : undefined;
+
+const tokens = (value?: TokenTotals | null): TokenTotals => ({
+  input: value?.input ?? 0,
+  output: value?.output ?? 0,
+  total: value?.total ?? 0,
+});
+
+async function migrate(database: Database) {
+  const current = (database.query("PRAGMA user_version").get() as { user_version?: number } | null)
+    ?.user_version ?? 0;
+  const migrations = (await readdir(MIGRATIONS_DIR))
+    .map((filename) => {
+      const version = Number(filename.match(/^(\d+)_.*\.sql$/)?.[1]);
+      return Number.isFinite(version) ? { filename, version } : null;
     })
-    .filter((migration): migration is Migration => migration !== null)
+    .filter((migration): migration is { filename: string; version: number } => Boolean(migration))
     .sort((a, b) => a.version - b.version);
-}
 
-function getSchemaVersion(database: Database): number {
-  const row = database.query("PRAGMA user_version").get() as {
-    user_version?: number;
-  } | null;
-  return row?.user_version ?? 0;
-}
-
-async function applyMigrations(database: Database): Promise<void> {
-  const currentVersion = getSchemaVersion(database);
-  const migrations = await listMigrations();
-  const runMigration = database.transaction((sql: string, version: number) => {
-    database.run(sql);
+  const run = database.transaction((migrationSql: string, version: number) => {
+    database.run(migrationSql);
     database.run(`PRAGMA user_version = ${version}`);
   });
 
   for (const migration of migrations) {
-    if (migration.version <= currentVersion) continue;
-
-    const sql = await readFile(join(MIGRATIONS_DIR, migration.filename), "utf-8");
-    runMigration(sql, migration.version);
+    if (migration.version <= current) continue;
+    run(await readFile(join(MIGRATIONS_DIR, migration.filename), "utf-8"), migration.version);
   }
 }
 
-async function getDb(): Promise<Database | null> {
+async function getDb(): Promise<Db | null> {
   try {
-    await mkdir(config.paths.dataDir, {
-      recursive: true,
-      mode: config.storage.directoryMode,
-    });
-    if (!db) {
-      db = new Database(config.paths.databaseFile);
-      db.run("PRAGMA foreign_keys = ON");
-      await applyMigrations(db);
+    await ensureDataDir();
+    if (!sqlite || !db) {
+      sqlite = new Database(config.paths.databaseFile);
+      sqlite.run("PRAGMA foreign_keys = ON");
+      await migrate(sqlite);
+      db = drizzle(sqlite, { schema });
     }
     return db;
-  } catch {
+  } catch (error) {
+    console.error("Failed to open Arc database:", error);
     return null;
   }
 }
 
-function getState(database: Database, key: string): string | null {
-  const row = database
-    .query("SELECT value FROM app_state WHERE key = ?")
-    .get(key) as { value: string } | null;
-  return row?.value ?? null;
+function reviveToolCall(row: ToolCallRow): ToolCall {
+  const startedAt = toDate(row.startedAt);
+  const completedAt = toDate(row.completedAt);
+  return {
+    id: row.id,
+    ...(row.approvalId ? { approvalId: row.approvalId } : {}),
+    assistantMessageIndex: row.assistantMessageIndex,
+    name: row.name,
+    args: fromJson(row.argsJson, {}),
+    status: row.status,
+    timestamp: new Date(row.timestamp),
+    ...(row.resultJson ? { result: fromJson(row.resultJson, undefined) } : {}),
+    ...(row.errorJson ? { error: fromJson(row.errorJson, undefined) } : {}),
+    ...(startedAt ? { startedAt } : {}),
+    ...(completedAt ? { completedAt } : {}),
+    ...(row.durationMs !== null ? { durationMs: row.durationMs } : {}),
+  };
 }
 
-function setState(database: Database, key: string, value: string): void {
-  database
-    .query(`
-      INSERT INTO app_state (key, value)
-      VALUES (?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `)
-    .run(key, value);
+function setCurrentSession(database: Db, sessionId: string) {
+  database.insert(schema.appState)
+    .values({ key: "current_session_id", value: sessionId })
+    .onConflictDoUpdate({
+      target: schema.appState.key,
+      set: { value: sessionId },
+    })
+    .run();
 }
 
-function saveSessionInDb(database: Database, session: PersistedSession): void {
-  database.transaction((sessionToSave: PersistedSession) => {
-    const tokens = normalizeTokens(sessionToSave.cumulativeTokens);
-    const now = new Date().toISOString();
-    const updatedAt = sessionToSave.timestamp ?? now;
-
-    database
-      .query(`
-        INSERT INTO sessions (
-          id,
-          title,
-          model,
-          conversation_summary,
-          input_tokens,
-          output_tokens,
-          total_tokens,
-          created_at,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          title = excluded.title,
-          model = excluded.model,
-          conversation_summary = excluded.conversation_summary,
-          input_tokens = excluded.input_tokens,
-          output_tokens = excluded.output_tokens,
-          total_tokens = excluded.total_tokens,
-          updated_at = excluded.updated_at
-      `)
-      .run(
-        sessionToSave.id,
-        sessionToSave.title,
-        sessionToSave.model ?? null,
-        sessionToSave.conversationSummary ?? "",
-        tokens.input,
-        tokens.output,
-        tokens.total,
-        now,
-        updatedAt,
-      );
-
-    database.query("DELETE FROM messages WHERE session_id = ?").run(sessionToSave.id);
-    database.query("DELETE FROM tool_calls WHERE session_id = ?").run(sessionToSave.id);
-
-    const insertMessage = database.query(`
-      INSERT INTO messages (session_id, role, content, order_index, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    sessionToSave.messages.forEach((message, index) => {
-      insertMessage.run(sessionToSave.id, message.role, message.content, index, now);
-    });
-
-    const insertToolCall = database.query(`
-      INSERT INTO tool_calls (
-        id,
-        session_id,
-        assistant_message_index,
-        name,
-        args_json,
-        result_json,
-        status,
-        timestamp
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    sessionToSave.toolCalls.forEach((toolCall) => {
-      insertToolCall.run(
-        toolCall.id,
-        sessionToSave.id,
-        toolCall.assistantMessageIndex,
-        toolCall.name,
-        JSON.stringify(toolCall.args ?? {}),
-        toolCall.result === undefined ? null : JSON.stringify(toolCall.result),
-        toolCall.status,
-        toolCall.timestamp.toISOString(),
-      );
-    });
-  })(session);
-}
-
-function readSession(database: Database, sessionId: string): PersistedSession | null {
-  const session = database
-    .query("SELECT * FROM sessions WHERE id = ?")
-    .get(sessionId) as SessionRow | null;
+function readSession(database: Db, sessionId: string) {
+  const session = database.select().from(schema.sessions).where(eq(schema.sessions.id, sessionId)).get();
   if (!session) return null;
 
-  const messages = database
-    .query(`
-      SELECT role, content
-      FROM messages
-      WHERE session_id = ?
-      ORDER BY order_index ASC
-    `)
-    .all(sessionId) as MessageRow[];
+  const messages = database.select({
+    role: schema.messages.role,
+    content: schema.messages.content,
+  })
+    .from(schema.messages)
+    .where(eq(schema.messages.sessionId, sessionId))
+    .orderBy(schema.messages.orderIndex)
+    .all();
 
-  const toolCalls = database
-    .query(`
-      SELECT *
-      FROM tool_calls
-      WHERE session_id = ?
-      ORDER BY timestamp ASC
-    `)
-    .all(sessionId) as ToolCallRow[];
+  const toolCalls = database.select()
+    .from(schema.toolCalls)
+    .where(eq(schema.toolCalls.sessionId, sessionId))
+    .orderBy(schema.toolCalls.timestamp)
+    .all();
 
-  return toPersistedSession(
-    session,
-    messages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    })),
-    toolCalls.map(reviveToolCall),
-  );
+  return {
+    id: session.id,
+    title: session.title,
+    messages,
+    toolCalls: toolCalls.map(reviveToolCall),
+    timestamp: session.updatedAt,
+    ...(session.model ? { model: session.model } : {}),
+    conversationSummary: session.conversationSummary,
+    cumulativeTokens: {
+      input: session.inputTokens,
+      output: session.outputTokens,
+      total: session.totalTokens,
+    },
+  };
+}
+
+export type PersistedSession = NonNullable<ReturnType<typeof readSession>>;
+
+function saveToDb(database: Db, session: PersistedSession) {
+  database.transaction((tx) => {
+    const now = new Date().toISOString();
+    const updatedAt = session.timestamp ?? now;
+    const totals = tokens(session.cumulativeTokens);
+
+    tx.insert(schema.sessions)
+      .values({
+        id: session.id,
+        title: session.title,
+        model: session.model ?? null,
+        conversationSummary: session.conversationSummary ?? "",
+        inputTokens: totals.input,
+        outputTokens: totals.output,
+        totalTokens: totals.total,
+        createdAt: now,
+        updatedAt,
+      })
+      .onConflictDoUpdate({
+        target: schema.sessions.id,
+        set: {
+          title: session.title,
+          model: session.model ?? null,
+          conversationSummary: session.conversationSummary ?? "",
+          inputTokens: totals.input,
+          outputTokens: totals.output,
+          totalTokens: totals.total,
+          updatedAt,
+        },
+      })
+      .run();
+
+    tx.delete(schema.messages).where(eq(schema.messages.sessionId, session.id)).run();
+    tx.delete(schema.toolCalls).where(eq(schema.toolCalls.sessionId, session.id)).run();
+
+    if (session.messages.length) {
+      tx.insert(schema.messages).values(session.messages.map((message, orderIndex) => ({
+        sessionId: session.id,
+        role: message.role,
+        content: message.content,
+        orderIndex,
+        createdAt: now,
+      }))).run();
+    }
+
+    if (session.toolCalls.length) {
+      tx.insert(schema.toolCalls).values(session.toolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        approvalId: toolCall.approvalId ?? null,
+        sessionId: session.id,
+        assistantMessageIndex: toolCall.assistantMessageIndex,
+        name: toolCall.name,
+        argsJson: toJson(toolCall.args ?? {}) ?? "{}",
+        resultJson: toJson(toolCall.result),
+        errorJson: toJson(toolCall.error),
+        status: toolCall.status,
+        timestamp: toolCall.timestamp.toISOString(),
+        startedAt: toolCall.startedAt?.toISOString() ?? null,
+        completedAt: toolCall.completedAt?.toISOString() ?? null,
+        durationMs: toolCall.durationMs ?? null,
+      }))).run();
+    }
+  });
 }
 
 export async function createSession(model?: string): Promise<PersistedSession | null> {
   const database = await getDb();
   if (!database) return null;
 
-  const id = generateSessionId();
-  const now = new Date().toISOString();
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const session: PersistedSession = {
     id,
     title: `Session ${new Date().toLocaleString()}`,
     messages: [],
     toolCalls: [],
-    timestamp: now,
+    timestamp: new Date().toISOString(),
     model,
     conversationSummary: "",
-    cumulativeTokens: { ...EMPTY_TOKENS },
+    cumulativeTokens: EMPTY_TOKENS,
   };
 
   try {
-    saveSessionInDb(database, session);
-    setState(database, "current_session_id", id);
+    saveToDb(database, session);
+    setCurrentSession(database, id);
     return session;
-  } catch {
+  } catch (error) {
+    console.error("Failed to create session:", error);
     return null;
   }
 }
 
-export async function listSessions(): Promise<SessionMeta[]> {
+export async function listSessions() {
   const database = await getDb();
   if (!database) return [];
 
-  const rows = database
-    .query(`
-      SELECT
-        s.id,
-        s.title,
-        s.updated_at AS timestamp,
-        s.model,
-        COUNT(m.id) AS message_count
-      FROM sessions s
-      LEFT JOIN messages m ON m.session_id = s.id
-      GROUP BY s.id
-      ORDER BY s.updated_at DESC
-    `)
-    .all() as SessionMetaRow[];
-
-  return rows.map((row) => ({
-    id: row.id,
-    title: row.title,
-    timestamp: row.timestamp,
-    messageCount: Number(row.message_count),
-    ...(row.model ? { model: row.model } : {}),
-  }));
+  return database.select({
+    id: schema.sessions.id,
+    title: schema.sessions.title,
+    timestamp: schema.sessions.updatedAt,
+    model: schema.sessions.model,
+    messageCount: sql<number>`cast(count(${schema.messages.id}) as int)`,
+  })
+    .from(schema.sessions)
+    .leftJoin(schema.messages, eq(schema.messages.sessionId, schema.sessions.id))
+    .groupBy(schema.sessions.id)
+    .orderBy(desc(schema.sessions.updatedAt))
+    .all()
+    .map(({ model, ...session }) => ({
+      ...session,
+      ...(model ? { model } : {}),
+    }));
 }
+
+export type SessionMeta = Awaited<ReturnType<typeof listSessions>>[number];
 
 export async function saveSession(
   sessionId: string,
@@ -392,27 +276,28 @@ export async function saveSession(
   conversationSummary?: string,
   cumulativeTokens?: TokenTotals,
   title?: string,
-): Promise<void> {
+) {
   const database = await getDb();
   if (!database) return;
 
   const existing = readSession(database, sessionId);
-  const session: PersistedSession = {
-    id: sessionId,
-    title: title ?? existing?.title ?? deriveTitle(messages, sessionId),
-    messages,
-    toolCalls,
-    timestamp: new Date().toISOString(),
-    model,
-    conversationSummary: conversationSummary ?? existing?.conversationSummary ?? "",
-    cumulativeTokens: normalizeTokens(cumulativeTokens ?? existing?.cumulativeTokens),
-  };
-
+  const firstUser = messages.find((msg) => msg.role === "user")?.content?.trim();
   try {
-    saveSessionInDb(database, session);
-    setState(database, "current_session_id", sessionId);
-  } catch {
-    // Session persistence is best-effort.
+    saveToDb(database, {
+      id: sessionId,
+      title: title ?? existing?.title ?? (firstUser
+        ? firstUser.replace(/\s+/g, " ").slice(0, 48)
+        : `Session ${sessionId.slice(0, 8)}`),
+      messages,
+      toolCalls,
+      timestamp: new Date().toISOString(),
+      model,
+      conversationSummary: conversationSummary ?? existing?.conversationSummary ?? "",
+      cumulativeTokens: tokens(cumulativeTokens ?? existing?.cumulativeTokens),
+    });
+    setCurrentSession(database, sessionId);
+  } catch (error) {
+    console.error("Failed to save session:", error);
   }
 }
 
@@ -422,38 +307,31 @@ export async function loadSession(sessionId?: string): Promise<PersistedSession 
 
   if (sessionId) {
     const session = readSession(database, sessionId);
-    if (session) setState(database, "current_session_id", session.id);
+    if (session) setCurrentSession(database, session.id);
     return session;
   }
 
-  const current = getState(database, "current_session_id");
-  if (current) {
-    const session = readSession(database, current);
-    if (session) return session;
-  }
+  const current = database.select({ value: schema.appState.value })
+    .from(schema.appState)
+    .where(eq(schema.appState.key, "current_session_id"))
+    .get()?.value;
+  const session = current ? readSession(database, current) : null;
+  if (session) return session;
 
-  const latest = database
-    .query("SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1")
-    .get() as { id: string } | null;
-
+  const latest = database.select({ id: schema.sessions.id })
+    .from(schema.sessions)
+    .orderBy(desc(schema.sessions.updatedAt))
+    .limit(1)
+    .get();
   if (!latest) return null;
-  const session = readSession(database, latest.id);
-  if (session) setState(database, "current_session_id", session.id);
-  return session;
+
+  const loaded = readSession(database, latest.id);
+  if (loaded) setCurrentSession(database, loaded.id);
+  return loaded;
 }
 
-export async function clearSession(sessionId: string): Promise<void> {
+export async function clearSession(sessionId: string) {
   const database = await getDb();
-  if (!database) return;
-
-  const existing = readSession(database, sessionId);
-  await saveSession(
-    sessionId,
-    [],
-    [],
-    existing?.model,
-    "",
-    { ...EMPTY_TOKENS },
-    existing?.title,
-  );
+  const existing = database ? readSession(database, sessionId) : null;
+  await saveSession(sessionId, [], [], existing?.model, "", EMPTY_TOKENS, existing?.title);
 }

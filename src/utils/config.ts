@@ -1,3 +1,4 @@
+import { mkdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import { WORKSPACE_ROOT } from "@/utils/workspace";
@@ -9,9 +10,11 @@ const arcDatabaseFile = join(arcHomeDir, "arc.db");
 
 const availableModels = [
     "qwen/qwen3.5-122b-a10b",
-    "moonshotai/kimi-k2.5",
-    "z-ai/glm5",
+    "moonshotai/kimi-k2.6",
+    "z-ai/glm-5.1",
     "minimaxai/minimax-m2.7",
+    "meta/llama-3_3-70b-instruct",
+
 ] as const;
 
 export const config = {
@@ -64,3 +67,10 @@ export const config = {
         },
     },
 } as const;
+
+export async function ensureDataDir() {
+    await mkdir(config.paths.dataDir, {
+        recursive: true,
+        mode: config.storage.directoryMode,
+    });
+}

@@ -1,4 +1,4 @@
-export { createFileTool, writeFileTool, readFileTool } from "./file";
+export { createFileTool, applyPatchTool, readFileTool } from "./file";
 export { createDirTool, readDirTool } from "./dir";
 export { subAgentTool } from "./subagent";
 export { runCommandTool } from "./command";

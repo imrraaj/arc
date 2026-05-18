@@ -2,25 +2,33 @@ import { tool } from 'ai';
 import { z } from 'zod';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname } from 'path';
+import { applyPatch } from 'diff';
 import { resolveWorkspacePath } from '@/utils/workspace';
 
-export const writeFileTool = tool({
-  description: 'Replace a unique string in a file with new content',
+export const applyPatchTool = tool({
+  description: 'Apply a unified diff patch to one file in the workspace. Generate the patch first so the user can approve the exact diff.',
   inputSchema: z.object({
     path: z.string().describe('File path relative to project root (or absolute path)'),
-    oldStr: z.string().describe('Exact string to find (must be unique)'),
-    newStr: z.string().describe('Replacement string'),
+    patch: z.string().describe('Unified diff patch for this file'),
   }),
   needsApproval: true,
-  execute: async ({ path, oldStr, newStr }) => {
+  execute: async ({ path, patch }) => {
     const resolvedPath = resolveWorkspacePath(path);
     const content = await readFile(resolvedPath, 'utf-8');
-    if (!content.includes(oldStr)) return 'Error: oldStr not found in file';
-    const count = content.split(oldStr).length - 1;
-    if (count > 1) return `Error: oldStr found ${count} times, must be unique`;
-    const updated = content.replace(oldStr, newStr);
+    const updated = applyPatch(content, patch, { fuzzFactor: 0 });
+    if (updated === false) {
+      return {
+        ok: false,
+        path: resolvedPath,
+        error: 'Patch did not apply cleanly',
+      };
+    }
     await writeFile(resolvedPath, updated);
-    return `Replaced in ${resolvedPath}`;
+    return {
+      ok: true,
+      path: resolvedPath,
+      bytesWritten: updated.length,
+    };
   },
 });
 

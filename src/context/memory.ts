@@ -1,4 +1,4 @@
-import { generateText, tool } from "ai";
+import { generateText, tool, type LanguageModel } from "ai";
 import { z } from "zod";
 import type { Message } from "../types";
 import { config as appConfig } from "@/utils/config";
@@ -21,7 +21,7 @@ export function shouldCompact(
 
 async function summarizeMessages(
   messages: Message[],
-  model: any,
+  model: LanguageModel,
   signal?: AbortSignal
 ): Promise<string> {
   if (messages.length === 0) {
@@ -41,8 +41,11 @@ async function summarizeMessages(
     });
 
     return result.text.trim();
-  } catch (error: any) {
-    if (error?.name === "AbortError" || error?.message?.includes("abort")) {
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === "AbortError" || error.message.includes("abort"))
+    ) {
       throw error;
     }
     console.error("Failed to summarize messages:", error);
@@ -52,7 +55,7 @@ async function summarizeMessages(
 
 export async function prepareMessages(
   messages: Message[],
-  model: any,
+  model: LanguageModel,
   signal?: AbortSignal,
   forceCompact: boolean = false
 ): Promise<{
@@ -81,7 +84,7 @@ export const compactMemoryTool = tool({
     force: z.boolean().optional().describe("Force compaction even if not at threshold"),
   }),
   needsApproval: false,
-  execute: async ({ force }, { abortSignal }) => {
+  execute: async ({ force }) => {
     return {
       shouldCompact: true,
       force: force || false,

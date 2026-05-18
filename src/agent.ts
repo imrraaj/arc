@@ -1,5 +1,6 @@
 import {
   type LanguageModelUsage,
+  type ModelMessage,
   type ToolApprovalResponse,
   stepCountIs,
   streamText,
@@ -12,7 +13,7 @@ import {
   compactMemoryTool,
   shouldCompact,
 } from "@/context/memory";
-import { webSearchTool, createFileTool, readFileTool, subAgentTool, writeFileTool } from "@/tools";
+import { webSearchTool, applyPatchTool, createFileTool, readFileTool, subAgentTool } from "@/tools";
 import {
   discoverSkills,
   discoverSkillsTool,
@@ -32,7 +33,7 @@ interface RunAgentTurnOptions {
   nvidiaApiKey: string;
   conversationSummary: string;
   abortSignal?: AbortSignal;
-  askUserApproval: (toolName: string, args: Record<string, any>) => Promise<boolean>;
+  askUserApproval: (toolCall: ApprovalToolCall) => Promise<boolean>;
   onMessagesChange: (update: StateUpdate<Message[]>) => void;
   onToolCallsChange: (update: StateUpdate<ToolCall[]>) => void;
   onStreamText: (text: string) => void;
@@ -41,17 +42,26 @@ interface RunAgentTurnOptions {
   onUsage: (usage: LanguageModelUsage | undefined) => void;
 }
 
-function isAbortError(error: any): boolean {
+type ApprovalToolCall = {
+  id: string;
+  approvalId: string;
+  name: string;
+  args: Record<string, unknown>;
+};
+
+function isAbortError(error: unknown): boolean {
+  const err = error as { name?: unknown; message?: unknown; cause?: unknown };
+  const cause = err.cause as { name?: unknown } | undefined;
   return (
-    error?.name === "AbortError" ||
-    error?.message?.includes("abort") ||
-    (error?.cause && error.cause.name === "AbortError")
+    err.name === "AbortError" ||
+    (typeof err.message === "string" && err.message.includes("abort")) ||
+    cause?.name === "AbortError"
   );
 }
 
-function toModelMessages(messages: Message[]) {
+function toModelMessages(messages: Message[]): ModelMessage[] {
   return messages.map((m) => ({
-    role: m.role as "user" | "assistant",
+    role: m.role,
     content: m.content,
   }));
 }
@@ -62,6 +72,54 @@ function removeCompactionMessage(messages: Message[]): Message[] {
     return messages.slice(0, -1);
   }
   return messages;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return error;
+}
+
+function textFromContent(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+
+  return value
+    .map((part) =>
+      part &&
+      typeof part === "object" &&
+      "text" in part &&
+      typeof part.text === "string"
+        ? part.text
+        : ""
+    )
+    .join("");
+}
+
+function firstText(...values: unknown[]) {
+  return values
+    .map(textFromContent)
+    .find((text) => text.trim().length > 0)
+    ?.trimEnd() ?? "";
+}
+
+function textFromMessages(messages: ModelMessage[]) {
+  return firstText(
+    ...messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.content)
+  );
 }
 
 export async function runAgentTurn({
@@ -84,7 +142,7 @@ export async function runAgentTurn({
   const needsCompaction = shouldCompact(messages, prompt);
   const model = nvidia(selectedModel, nvidiaApiKey);
 
-  let messagesToSend: any[] = toModelMessages(messagesWithPrompt);
+  let messagesToSend: ModelMessage[] = toModelMessages(messagesWithPrompt);
 
   if (conversationSummary) {
     messagesToSend = [
@@ -115,7 +173,7 @@ export async function runAgentTurn({
       if (prepared.summary) {
         onConversationSummary(prepared.summary);
       }
-    } catch (error: any) {
+    } catch (error) {
       if (isAbortError(error)) return;
       console.error("Memory compaction failed:", error);
     } finally {
@@ -143,12 +201,54 @@ export async function runAgentTurn({
           run_command: runCommandTool,
           compact_memory: compactMemoryTool,
           read_file: readFileTool,
-          write_file: writeFileTool,
+          apply_patch: applyPatchTool,
           create_file: createFileTool,
         },
         experimental_context: {
           skills,
           nvidiaApiKey,
+        },
+        experimental_onToolCallStart: ({ toolCall }) => {
+          const id = toolCall.toolCallId;
+          onToolCallsChange((prev) => {
+            const existing = prev.find((tc) => tc.id === id);
+            if (existing) {
+              return prev.map((tc) =>
+                tc.id === id
+                  ? { ...tc, status: "running", startedAt: new Date() }
+                  : tc
+              );
+            }
+            return [
+              ...prev,
+              {
+                id,
+                assistantMessageIndex,
+                name: toolCall.toolName,
+                args: asRecord(toolCall.input),
+                status: "running",
+                timestamp: new Date(),
+                startedAt: new Date(),
+              },
+            ];
+          });
+        },
+        experimental_onToolCallFinish: ({ toolCall, durationMs, success, output, error }) => {
+          const id = toolCall.toolCallId;
+          onToolCallsChange((prev) =>
+            prev.map((tc) =>
+              tc.id === id
+                ? {
+                    ...tc,
+                    status: success ? "completed" : "error",
+                    result: success ? output : tc.result,
+                    error: success ? undefined : serializeError(error),
+                    completedAt: new Date(),
+                    durationMs,
+                  }
+                : tc
+            )
+          );
         },
         onFinish: ({ usage }) => onUsage(usage),
       });
@@ -159,10 +259,19 @@ export async function runAgentTurn({
         onStreamText(fullText);
       }
 
-      const [content, response] = await Promise.all([
+      const [content, response, finalText, reasoningText] = await Promise.all([
         result.content,
         result.response,
+        result.text,
+        result.reasoningText,
       ]);
+      const assistantText = firstText(
+        fullText,
+        finalText,
+        content,
+        textFromMessages(response.messages),
+        reasoningText
+      );
 
       const approvalRequests = content.filter(
         (p) => p.type === "tool-approval-request"
@@ -171,7 +280,7 @@ export async function runAgentTurn({
       if (approvalRequests.length === 0) {
         onMessagesChange((prev) => [
           ...prev,
-          { role: "assistant", content: fullText },
+          { role: "assistant", content: assistantText || "(empty response)" },
         ]);
         onToolCallsChange((prev) =>
           prev.map((tc) =>
@@ -187,12 +296,13 @@ export async function runAgentTurn({
       onStreamText("");
 
       const pendingToolCalls: ToolCall[] = approvalRequests.map((req) => {
-        const r = req as any;
+        const r = req;
         return {
-          id: r.approvalId,
-          assistantMessageIndex: -1,
+          id: r.toolCall.toolCallId,
+          approvalId: r.approvalId,
+          assistantMessageIndex,
           name: r.toolCall.toolName,
-          args: r.toolCall.input,
+          args: asRecord(r.toolCall.input),
           status: "pending" as const,
           timestamp: new Date(),
         };
@@ -201,16 +311,23 @@ export async function runAgentTurn({
 
       const approvals: ToolApprovalResponse[] = [];
       for (const req of approvalRequests) {
-        const r = req as any;
-        const approved = await askUserApproval(
-          r.toolCall.toolName,
-          r.toolCall.input
-        );
+        const r = req;
+        const approved = await askUserApproval({
+          id: r.toolCall.toolCallId,
+          approvalId: r.approvalId,
+          name: r.toolCall.toolName,
+          args: asRecord(r.toolCall.input),
+        });
 
         onToolCallsChange((prev) =>
           prev.map((tc) =>
-            tc.id === r.approvalId
-              ? { ...tc, status: approved ? "running" : "denied" }
+            tc.id === r.toolCall.toolCallId
+              ? {
+                  ...tc,
+                  status: approved ? "approved" : "denied",
+                  result: approved ? tc.result : { approved: false },
+                  completedAt: approved ? tc.completedAt : new Date(),
+                }
               : tc
           )
         );
@@ -224,20 +341,22 @@ export async function runAgentTurn({
 
       messagesToSend = [
         ...messagesToSend,
-        ...(response.messages as any[]),
+        ...response.messages,
         { role: "tool", content: approvals },
       ];
 
       onToolCallsChange((prev) =>
         prev.map((tc) =>
-          tc.status === "running" ? { ...tc, status: "completed" } : tc
+          tc.status === "running" && tc.result !== undefined
+            ? { ...tc, status: "completed", completedAt: tc.completedAt ?? new Date() }
+            : tc
         )
       );
     }
-  } catch (error: any) {
+  } catch (error) {
     const content = isAbortError(error)
       ? "Generation cancelled."
-      : `Error: ${error?.message || "Failed to reach LLM"}`;
+      : `Error: ${error instanceof Error ? error.message : "Failed to reach LLM"}`;
 
     onMessagesChange((prev) => [
       ...prev,

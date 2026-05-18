@@ -1,20 +1,27 @@
-export interface Message {
+export type Message = {
   role: "user" | "assistant" | "system";
   content: string;
-}
+};
 
-export interface ToolCall {
+export type ToolCall = {
   id: string;
+  approvalId?: string;
   assistantMessageIndex: number;
   name: string;
-  args: Record<string, any>;
-  result?: any;
+  args: Record<string, unknown>;
+  result?: unknown;
+  error?: unknown;
   status: "pending" | "approved" | "denied" | "running" | "completed" | "error";
   timestamp: Date;
-}
+  startedAt?: Date;
+  completedAt?: Date;
+  durationMs?: number;
+};
 
-export interface PendingApproval {
+export type PendingApproval = {
+  id: string;
+  approvalId: string;
   toolName: string;
-  args: Record<string, any>;
+  args: Record<string, unknown>;
   resolve: (approved: boolean) => void;
-}
+};

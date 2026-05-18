@@ -1,5 +1,5 @@
-import { readFile, writeFile, chmod, mkdir } from "fs/promises";
-import { config } from "@/utils/config";
+import { readFile, writeFile, chmod } from "fs/promises";
+import { config, ensureDataDir } from "@/utils/config";
 
 export interface ArcSettings {
   nvidiaApiKey?: string;
@@ -16,10 +16,7 @@ export async function loadSettings(): Promise<ArcSettings> {
 
 export async function saveSettings(settings: ArcSettings): Promise<boolean> {
   try {
-    await mkdir(config.paths.dataDir, {
-      recursive: true,
-      mode: config.storage.directoryMode,
-    });
+    await ensureDataDir();
     await writeFile(config.paths.settingsFile, JSON.stringify(settings, null, 2), {
       mode: config.storage.settingsFileMode,
     });

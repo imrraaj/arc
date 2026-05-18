@@ -120,17 +120,16 @@ Reads a file from the workspace. Paths can be relative or absolute, but they mus
 
 This does not require approval because it only reads.
 
-### `write_file`
+### `apply_patch`
 
-Replaces one exact string in a file.
+Applies a unified diff patch to one file.
 
 The tool requires:
 
 - `path`
-- `oldStr`
-- `newStr`
+- `patch`
 
-It refuses to write if `oldStr` is missing or appears more than once. This makes edits more deliberate and avoids replacing the wrong block.
+The patch is passed through the approval UI before execution, so the user approves the actual diff instead of a vague write request. Patches apply with zero fuzz; if the file has drifted and the patch no longer matches cleanly, the tool returns an error instead of guessing.
 
 This requires approval.
 
@@ -217,7 +216,7 @@ Runs a smaller tool-using agent for a specific prompt.
 The subagent gets its own model call and a smaller toolset:
 
 - `readFile`
-- `writeFile`
+- `applyPatch`
 - `createFile`
 - `createDir`
 - `readDir`
@@ -298,8 +297,11 @@ For each tool call Arc stores:
 - tool name
 - args as JSON
 - result as JSON when available
+- error as JSON when a tool fails
 - status
 - timestamp
+- started/completed timestamps
+- duration in milliseconds
 
 The UI groups tool calls by the assistant message index so the transcript can show which assistant turn produced which tool activity. Tool calls that are still pending or running are shown separately until they are attached to the final assistant message.
 
@@ -364,7 +366,6 @@ Some things are intentionally still simple:
 - token counting is approximate
 - shell execution is approval-gated but not a real OS sandbox
 - Tavily still uses `TAVILY_API_KEY` from the environment
-- tool results are only persisted when the tool call object has a result attached
 - the UI currently shows the last 10 messages instead of a full transcript browser
 - subagents do not have their own persisted sessions yet
 
